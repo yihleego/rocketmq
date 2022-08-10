@@ -151,6 +151,9 @@ import org.apache.rocketmq.store.hook.SendMessageBackHook;
 import org.apache.rocketmq.store.stats.BrokerStats;
 import org.apache.rocketmq.store.stats.BrokerStatsManager;
 import org.apache.rocketmq.store.stats.LmqBrokerStatsManager;
+import org.apache.rocketmq.store.timer.TimerCheckpoint;
+import org.apache.rocketmq.store.timer.TimerMessageStore;
+import org.apache.rocketmq.store.timer.TimerMetrics;
 
 public class BrokerController {
     protected static final InternalLogger LOG = InternalLoggerFactory.getLogger(LoggerName.BROKER_LOGGER_NAME);
@@ -232,6 +235,8 @@ public class BrokerController {
     protected boolean updateMasterHAServerAddrPeriodically = false;
     private BrokerStats brokerStats;
     private InetSocketAddress storeHost;
+    private TimerMessageStore timerMessageStore;
+    private TimerCheckpoint timerCheckpoint;
     protected BrokerFastFailure brokerFastFailure;
     private Configuration configuration;
     protected TopicQueueMappingCleanService topicQueueMappingCleanService;
@@ -255,6 +260,7 @@ public class BrokerController {
     private final Lock lock = new ReentrantLock();
     protected final List<ScheduledFuture<?>> scheduledFutures = new ArrayList<>();
     protected ReplicasManager replicasManager;
+    private long lastSyncTimeMs = System.currentTimeMillis();
 
     public BrokerController(
         final BrokerConfig brokerConfig,
@@ -533,7 +539,7 @@ public class BrokerController {
 
     protected void initializeBrokerScheduledTasks() {
         final long initialDelay = UtilAll.computeNextMorningTimeMillis() - System.currentTimeMillis();
-        final long period = 1000 * 60 * 60 * 24;
+        final long period = TimeUnit.DAYS.toMillis(1);
         this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
             @Override
             public void run() {
@@ -620,12 +626,17 @@ public class BrokerController {
                     @Override
                     public void run() {
                         try {
-                            BrokerController.this.slaveSynchronize.syncAll();
+                            if (System.currentTimeMillis() - lastSyncTimeMs > 60 * 1000) {
+                                BrokerController.this.getSlaveSynchronize().syncAll();
+                                lastSyncTimeMs = System.currentTimeMillis();
+                            }
+                            //timer checkpoint, latency-sensitive, so sync it more frequently
+                            BrokerController.this.getSlaveSynchronize().syncTimerCheckPoint();
                         } catch (Throwable e) {
                             LOG.error("Failed to sync all config for slave.", e);
                         }
                     }
-                }, 1000 * 10, 1000 * 60, TimeUnit.MILLISECONDS);
+                }, 1000 * 10, 3 * 1000, TimeUnit.MILLISECONDS);
 
             } else {
                 this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
@@ -717,6 +728,13 @@ public class BrokerController {
                 if (this.brokerConfig.isEnableControllerMode()) {
                     this.replicasManager = new ReplicasManager(this);
                 }
+                if (messageStoreConfig.isTimerWheelEnable()) {
+                    this.timerCheckpoint = new TimerCheckpoint(BrokerPathConfigHelper.getTimerCheckPath(messageStoreConfig.getStorePathRootDir()));
+                    TimerMetrics timerMetrics = new TimerMetrics(BrokerPathConfigHelper.getTimerMetricsPath(messageStoreConfig.getStorePathRootDir()));
+                    this.timerMessageStore = new TimerMessageStore(messageStore, messageStoreConfig, timerCheckpoint, timerMetrics, brokerStatsManager);
+                    this.timerMessageStore.registerEscapeBridgeHook(msg -> escapeBridge.putMessage(msg));
+                    this.messageStore.setTimerMessageStore(this.timerMessageStore);
+                }
             } catch (IOException e) {
                 result = false;
                 LOG.error("BrokerController#initialize: unexpected error occurs", e);
@@ -727,6 +745,10 @@ public class BrokerController {
         }
 
         result = result && this.messageStore.load();
+
+        if (messageStoreConfig.isTimerWheelEnable()) {
+            result = result && this.timerMessageStore.load();
+        }
 
         //scheduleMessageService load after messageStore load success
         result = result && this.scheduleMessageService.load();
@@ -803,21 +825,25 @@ public class BrokerController {
         List<PutMessageHook> putMessageHookList = messageStore.getPutMessageHookList();
 
         putMessageHookList.add(new PutMessageHook() {
-            @Override public String hookName() {
+            @Override
+            public String hookName() {
                 return "checkBeforePutMessage";
             }
 
-            @Override public PutMessageResult executeBeforePutMessage(MessageExt msg) {
+            @Override
+            public PutMessageResult executeBeforePutMessage(MessageExt msg) {
                 return HookUtils.checkBeforePutMessage(BrokerController.this, msg);
             }
         });
 
         putMessageHookList.add(new PutMessageHook() {
-            @Override public String hookName() {
+            @Override
+            public String hookName() {
                 return "innerBatchChecker";
             }
 
-            @Override public PutMessageResult executeBeforePutMessage(MessageExt msg) {
+            @Override
+            public PutMessageResult executeBeforePutMessage(MessageExt msg) {
                 if (msg instanceof MessageExtBrokerInner) {
                     return HookUtils.checkInnerBatch(BrokerController.this, msg);
                 }
@@ -826,11 +852,13 @@ public class BrokerController {
         });
 
         putMessageHookList.add(new PutMessageHook() {
-            @Override public String hookName() {
+            @Override
+            public String hookName() {
                 return "handleScheduleMessage";
             }
 
-            @Override public PutMessageResult executeBeforePutMessage(MessageExt msg) {
+            @Override
+            public PutMessageResult executeBeforePutMessage(MessageExt msg) {
                 if (msg instanceof MessageExtBrokerInner) {
                     return HookUtils.handleScheduleMessage(BrokerController.this, (MessageExtBrokerInner) msg);
                 }
@@ -1154,6 +1182,14 @@ public class BrokerController {
         return popMessageProcessor;
     }
 
+    public TimerMessageStore getTimerMessageStore() {
+        return timerMessageStore;
+    }
+
+    public void setTimerMessageStore(TimerMessageStore timerMessageStore) {
+        this.timerMessageStore = timerMessageStore;
+    }
+
     public AckMessageProcessor getAckMessageProcessor() {
         return ackMessageProcessor;
     }
@@ -1217,7 +1253,10 @@ public class BrokerController {
         if (this.topicQueueMappingCleanService != null) {
             this.topicQueueMappingCleanService.shutdown();
         }
-
+        //it is better to make sure the timerMessageStore shutdown firstly
+        if (this.timerMessageStore != null) {
+            this.timerMessageStore.shutdown();
+        }
         if (this.fileWatchService != null) {
             this.fileWatchService.shutdown();
         }
@@ -1373,6 +1412,10 @@ public class BrokerController {
             this.messageStore.start();
         }
 
+        if (this.timerMessageStore != null) {
+            this.timerMessageStore.start();
+        }
+
         if (this.replicasManager != null) {
             this.replicasManager.start();
         }
@@ -1491,7 +1534,8 @@ public class BrokerController {
             scheduleSendHeartbeat();
 
             scheduledFutures.add(this.syncBrokerMemberGroupExecutorService.scheduleAtFixedRate(new AbstractBrokerRunnable(this.getBrokerIdentity()) {
-                @Override public void run2() {
+                @Override
+                public void run2() {
                     try {
                         BrokerController.this.syncBrokerMemberGroup();
                     } catch (Throwable e) {
@@ -1923,6 +1967,29 @@ public class BrokerController {
                 this.scheduleMessageService.stop();
             }
             isScheduleServiceStart = shouldStart;
+
+            if (timerMessageStore != null) {
+                timerMessageStore.setShouldRunningDequeue(shouldStart);
+            }
+        }
+    }
+
+    public MessageStore getMessageStoreByBrokerName(String brokerName) {
+        if (this.brokerConfig.getBrokerName().equals(brokerName)) {
+            return this.getMessageStore();
+        }
+        return null;
+    }
+
+    public BrokerIdentity getBrokerIdentity() {
+        if (messageStoreConfig.isEnableDLegerCommitLog()) {
+            return new BrokerIdentity(
+                brokerConfig.getBrokerClusterName(), brokerConfig.getBrokerName(),
+                Integer.parseInt(messageStoreConfig.getdLegerSelfId().substring(1)), brokerConfig.isInBrokerContainer());
+        } else {
+            return new BrokerIdentity(
+                brokerConfig.getBrokerClusterName(), brokerConfig.getBrokerName(),
+                brokerConfig.getBrokerId(), brokerConfig.isInBrokerContainer());
         }
     }
 
@@ -2168,25 +2235,6 @@ public class BrokerController {
         return scheduleMessageService;
     }
 
-    public MessageStore getMessageStoreByBrokerName(String brokerName) {
-        if (this.brokerConfig.getBrokerName().equals(brokerName)) {
-            return this.getMessageStore();
-        }
-        return null;
-    }
-
-    public BrokerIdentity getBrokerIdentity() {
-        if (messageStoreConfig.isEnableDLegerCommitLog()) {
-            return new BrokerIdentity(
-                brokerConfig.getBrokerClusterName(), brokerConfig.getBrokerName(),
-                Integer.parseInt(messageStoreConfig.getdLegerSelfId().substring(1)), brokerConfig.isInBrokerContainer());
-        } else {
-            return new BrokerIdentity(
-                brokerConfig.getBrokerClusterName(), brokerConfig.getBrokerName(),
-                brokerConfig.getBrokerId(), brokerConfig.isInBrokerContainer());
-        }
-    }
-
     public ReplicasManager getReplicasManager() {
         return replicasManager;
     }
@@ -2198,4 +2246,9 @@ public class BrokerController {
     public boolean isIsolated() {
         return this.isIsolated;
     }
+
+    public TimerCheckpoint getTimerCheckpoint() {
+        return timerCheckpoint;
+    }
+
 }

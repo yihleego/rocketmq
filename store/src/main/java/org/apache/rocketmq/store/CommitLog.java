@@ -56,6 +56,7 @@ import org.apache.rocketmq.store.ha.HAService;
 import org.apache.rocketmq.store.logfile.MappedFile;
 import org.apache.rocketmq.common.attribute.CQType;
 
+
 /**
  * Store all metadata downtime for recovery, data protection reliability
  */
@@ -710,7 +711,7 @@ public class CommitLog implements Swappable {
     private boolean isMappedFileMatchedRecover(final MappedFile mappedFile) {
         ByteBuffer byteBuffer = mappedFile.sliceByteBuffer();
 
-        int magicCode = byteBuffer.getInt(MessageDecoder.MESSAGE_MAGIC_CODE_POSTION);
+        int magicCode = byteBuffer.getInt(MessageDecoder.MESSAGE_MAGIC_CODE_POSITION);
         if (magicCode != MESSAGE_MAGIC_CODE) {
             return false;
         }
